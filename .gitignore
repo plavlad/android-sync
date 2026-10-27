@@ -1,0 +1,5 @@
+*.class
+build/
+.DS_Store
+*.tmp
+*.log

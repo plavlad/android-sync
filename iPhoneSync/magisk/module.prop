@@ -1,0 +1,6 @@
+id=iphonesync
+name=iPhone Continuity Call Sync
+version=v1.0
+versionCode=100
+author=Vladislav & Antigravity
+description=Автоматическая пауза видео на планшете при звонках на iPhone через BLE ANCS.
