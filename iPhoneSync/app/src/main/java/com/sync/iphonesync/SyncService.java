@@ -15,6 +15,7 @@ import android.media.AudioFocusRequest;
 import android.media.AudioManager;
 import android.media.session.MediaController;
 import android.media.session.MediaSessionManager;
+import android.media.session.PlaybackState;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
@@ -24,6 +25,7 @@ import android.util.Log;
 import android.view.KeyEvent;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -62,6 +64,8 @@ public class SyncService extends Service {
 
     private boolean isConnected = false;
     private boolean isCallActive = false;
+    private boolean wasPlayingBeforeCall = false;
+    private final List<String> packagesToResume = new ArrayList<>();
     private final Map<Integer, Integer> activeCallUids = new HashMap<>();
 
     private Runnable reconnectRunnable = new Runnable() {
@@ -267,7 +271,7 @@ public class SyncService extends Service {
 
                 ByteBuffer bb = ByteBuffer.wrap(val, 4, 4);
                 bb.order(ByteOrder.LITTLE_ENDIAN);
-                int uid = bb.getInt(); log(String.format("RAW ANCS: id=%d, flags=0x%02X, cat=%d, uid=0x%08X", eventId, eventFlags, categoryId, uid));
+                int uid = bb.getInt();
 
                 // Игнорируем архивные уведомления при первом подключении
                 if ((eventFlags & 0x04) != 0) {
@@ -308,25 +312,79 @@ public class SyncService extends Service {
         if (active) {
             if (isCallActive) return;
             isCallActive = true;
-            log(">>> [ПАУЗА ВИДЕО] " + reason + " <<<");
-            updateNotification("Звонок активен: Пауза видео");
-            pauseAllMedia();
+
+            // Запоминаем состояние воспроизведения ДО звонка
+            checkPreCallPlaybackState();
+
+            if (wasPlayingBeforeCall) {
+                log(">>> [ПАУЗА ВИДЕО] " + reason + " (Медиа воспроизводилось) <<<");
+                updateNotification("Звонок активен: Пауза видео");
+                pauseAllMedia();
+            } else {
+                log(">>> [ЗВОНОК] " + reason + " (Видео уже было на паузе — оставляем на паузе) <<<");
+                updateNotification("Звонок активен (видео на паузе)");
+            }
         } else {
             if (!isCallActive) return;
             isCallActive = false;
-            log(">>> [ВОЗОБНОВЛЕНИЕ ВИДЕО] " + reason + " <<<");
-            updateNotification("Подключено (Синхронизация активна)");
-            resumeAllMedia();
+
+            if (wasPlayingBeforeCall) {
+                log(">>> [ВОЗОБНОВЛЕНИЕ ВИДЕО] " + reason + " (Возврат к воспроизведению) <<<");
+                updateNotification("Подключено (Синхронизация активна)");
+                resumeAllMedia();
+            } else {
+                log(">>> [ЗВОНОК ОКОНЧЕН] " + reason + " (Медиа НЕ возобновляется, т.к. стояло на паузе до звонка) <<<");
+                updateNotification("Подключено (Синхронизация активна)");
+            }
+
+            wasPlayingBeforeCall = false;
+            packagesToResume.clear();
         }
+    }
+
+    private void checkPreCallPlaybackState() {
+        wasPlayingBeforeCall = false;
+        packagesToResume.clear();
+
+        try {
+            List<MediaController> controllers = mediaSessionManager.getActiveSessions(listenerComponent);
+            if (controllers != null) {
+                for (MediaController mc : controllers) {
+                    PlaybackState ps = mc.getPlaybackState();
+                    if (ps != null) {
+                        int state = ps.getState();
+                        log("Сессия " + mc.getPackageName() + " перед звонком: state=" + state);
+                        if (state == PlaybackState.STATE_PLAYING 
+                                || state == PlaybackState.STATE_BUFFERING 
+                                || state == PlaybackState.STATE_FAST_FORWARDING 
+                                || state == PlaybackState.STATE_REWINDING) {
+                            wasPlayingBeforeCall = true;
+                            packagesToResume.add(mc.getPackageName());
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log("Ошибка проверки MediaSession: " + e.getMessage());
+        }
+
+        if (!wasPlayingBeforeCall && audioManager != null && audioManager.isMusicActive()) {
+            wasPlayingBeforeCall = true;
+            log("AudioManager.isMusicActive() == true (обнаружено активное аудио)");
+        }
+
+        log("Состояние до звонка: " + (wasPlayingBeforeCall ? "ИГРАЕТ (будет возобновлено)" : "НА ПАУЗЕ (возобновляться НЕ будет)"));
     }
 
     private void pauseAllMedia() {
         // 1. Прямое управление через MediaSession (YouTube и другие плееры)
         try {
             List<MediaController> controllers = mediaSessionManager.getActiveSessions(listenerComponent);
-            for (MediaController mc : controllers) {
-                log("Пауза плеера: " + mc.getPackageName());
-                mc.getTransportControls().pause();
+            if (controllers != null) {
+                for (MediaController mc : controllers) {
+                    log("Пауза плеера: " + mc.getPackageName());
+                    mc.getTransportControls().pause();
+                }
             }
         } catch (Exception e) {
             log("Ошибка MediaSession: " + e.getMessage());
@@ -356,9 +414,13 @@ public class SyncService extends Service {
         // 1. Прямой запуск через MediaSession
         try {
             List<MediaController> controllers = mediaSessionManager.getActiveSessions(listenerComponent);
-            for (MediaController mc : controllers) {
-                log("Возобновление плеера: " + mc.getPackageName());
-                mc.getTransportControls().play();
+            if (controllers != null) {
+                for (MediaController mc : controllers) {
+                    if (packagesToResume.isEmpty() || packagesToResume.contains(mc.getPackageName())) {
+                        log("Возобновление плеера: " + mc.getPackageName());
+                        mc.getTransportControls().play();
+                    }
+                }
             }
         } catch (Exception e) {
             log("Ошибка MediaSession: " + e.getMessage());
